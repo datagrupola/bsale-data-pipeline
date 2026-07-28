@@ -1,0 +1,102 @@
+name: Extract Bsale products
+
+on:
+  workflow_dispatch:
+    inputs:
+      start_date:
+        description: "Fecha inicial fiscal (YYYY-MM-DD)"
+        required: true
+        type: string
+
+      end_date:
+        description: "Fecha final fiscal opcional (YYYY-MM-DD)"
+        required: false
+        type: string
+
+      office_id:
+        description: "Sucursal opcional: 2, 3 o 4"
+        required: false
+        type: string
+
+      max_documents:
+        description: "Límite opcional de documentos por sucursal"
+        required: false
+        type: string
+
+      return_quantity_policy:
+        description: "Política de piezas para devoluciones"
+        required: true
+        default: "NET"
+        type: choice
+        options:
+          - NET
+          - GROSS
+          - IGNORE
+
+permissions:
+  contents: read
+
+concurrency:
+  group: >-
+    bsale-products-${{ inputs.start_date }}-${{
+    inputs.end_date }}-${{ inputs.office_id }}
+  cancel-in-progress: false
+
+jobs:
+  extract:
+    name: Extract products and details
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    env:
+      BSALE_ACCESS_TOKEN: ${{ secrets.BSALE_ACCESS_TOKEN }}
+      PYTHONUNBUFFERED: "1"
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: python -m pip install --requirement requirements.txt
+
+      - name: Run unit tests
+        run: python -m unittest discover -s tests -v
+
+      - name: Extract products
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          args=(
+            --start-date "${{ inputs.start_date }}"
+            --return-quantity-policy "${{ inputs.return_quantity_policy }}"
+            --output-dir output
+          )
+
+          if [[ -n "${{ inputs.end_date }}" ]]; then
+            args+=(--end-date "${{ inputs.end_date }}")
+          fi
+
+          if [[ -n "${{ inputs.office_id }}" ]]; then
+            args+=(--office-id "${{ inputs.office_id }}")
+          fi
+
+          if [[ -n "${{ inputs.max_documents }}" ]]; then
+            args+=(--max-documents "${{ inputs.max_documents }}")
+          fi
+
+          python -m src.extract_products "${args[@]}"
+
+      - name: Upload extraction artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: bsale-products-${{ inputs.start_date }}
+          path: output/productos_*.json
+          if-no-files-found: error
+          retention-days: 7
