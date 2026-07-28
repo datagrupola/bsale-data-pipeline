@@ -1,0 +1,54 @@
+name: Extract Bsale daily sales
+
+on:
+  workflow_dispatch:
+    inputs:
+      date:
+        description: "Fecha fiscal a extraer (YYYY-MM-DD)"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bsale-daily-sales-${{ inputs.date }}
+  cancel-in-progress: false
+
+jobs:
+  extract:
+    name: Extract sales and payments
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    env:
+      BSALE_ACCESS_TOKEN: ${{ secrets.BSALE_ACCESS_TOKEN }}
+      PYTHONUNBUFFERED: "1"
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: python -m pip install --requirement requirements.txt
+
+      - name: Run unit tests
+        run: python -m unittest discover -s tests -v
+
+      - name: Extract daily sales
+        run: |
+          python -m src.extract_daily_sales             --date "${{ inputs.date }}"             --output-dir output
+
+      - name: Upload extraction artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: bsale-daily-sales-${{ inputs.date }}
+          path: output/*.json
+          if-no-files-found: error
+          retention-days: 7
