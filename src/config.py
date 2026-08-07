@@ -19,6 +19,9 @@ BSALE_TOKEN_ENV = "BSALE_ACCESS_TOKEN"
 
 DOCUMENTS_ENDPOINT = "/documents.json"
 PAYMENTS_ENDPOINT = "/payments.json"
+PRODUCT_TYPES_ENDPOINT = "/product_types.json"
+PRODUCTS_ENDPOINT = "/products.json"
+VARIANTS_ENDPOINT = "/variants.json"
 
 PAGE_LIMIT = int(os.getenv("BSALE_PAGE_LIMIT", "50"))
 MAX_OFFSET = int(os.getenv("BSALE_MAX_OFFSET", "100000"))
