@@ -1,0 +1,986 @@
+from __future__ import annotations
+
+import argparse
+import json
+from collections import defaultdict
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+from .extract_products import (
+    js_round_decimal,
+    number,
+    to_decimal,
+)
+
+
+def to_int(value: Any) -> int:
+    if value is None or value == "":
+        return 0
+
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return 0
+
+
+def is_meaningful_text(value: Any) -> bool:
+    text = str(value or "").strip().upper()
+
+    return text not in {
+        "",
+        "N/A",
+        "NA",
+        "NULL",
+        "UNDEFINED",
+    }
+
+
+def build_catalog_maps(
+    catalogs: dict[str, list[dict[str, Any]]],
+) -> tuple[
+    dict[int, dict[str, Any]],
+    dict[int, dict[str, Any]],
+    dict[int, dict[str, Any]],
+]:
+    product_type_map = {
+        to_int(row.get("product_type_id")): row
+        for row in catalogs["product_types"]
+        if to_int(row.get("product_type_id"))
+    }
+
+    product_map = {
+        to_int(row.get("product_id")): row
+        for row in catalogs["products"]
+        if to_int(row.get("product_id"))
+    }
+
+    variant_map = {
+        to_int(row.get("variant_id")): row
+        for row in catalogs["variants"]
+        if to_int(row.get("variant_id"))
+    }
+
+    return (
+        product_type_map,
+        product_map,
+        variant_map,
+    )
+
+
+def resolve_category(
+    variant_id: Any,
+    *,
+    variant_map: dict[int, dict[str, Any]],
+    product_map: dict[int, dict[str, Any]],
+    product_type_map: dict[int, dict[str, Any]],
+) -> dict[str, Any]:
+    clean_variant_id = to_int(variant_id)
+    variant = variant_map.get(clean_variant_id)
+
+    if variant is None:
+        return {
+            "variant_id": clean_variant_id or None,
+            "product_id": None,
+            "product_type_id": None,
+            "product_type_name": None,
+            "resolution_status": "MISSING_VARIANT",
+        }
+
+    product_id = to_int(
+        variant.get("product_id")
+    )
+
+    product = product_map.get(
+        product_id
+    )
+
+    if product is None:
+        return {
+            "variant_id": clean_variant_id,
+            "product_id": product_id or None,
+            "product_type_id": None,
+            "product_type_name": None,
+            "resolution_status": "MISSING_PRODUCT",
+        }
+
+    product_type_id = to_int(
+        product.get("product_type_id")
+    )
+
+    if not product_type_id:
+        return {
+            "variant_id": clean_variant_id,
+            "product_id": product_id,
+            "product_type_id": None,
+            "product_type_name": None,
+            "resolution_status": "MISSING_PRODUCT_TYPE",
+        }
+
+    product_type = product_type_map.get(
+        product_type_id
+    )
+
+    if (
+        product_type is None
+        or not is_meaningful_text(
+            product_type.get(
+                "product_type_name"
+            )
+        )
+    ):
+        return {
+            "variant_id": clean_variant_id,
+            "product_id": product_id,
+            "product_type_id": product_type_id,
+            "product_type_name": None,
+            "resolution_status": "MISSING_PRODUCT_TYPE",
+        }
+
+    return {
+        "variant_id": clean_variant_id,
+        "product_id": product_id,
+        "product_type_id": product_type_id,
+        "product_type_name": str(
+            product_type[
+                "product_type_name"
+            ]
+        ).strip(),
+        "resolution_status": "OK",
+    }
+
+
+def build_categories_daily_summary(
+    product_rows: list[dict[str, Any]],
+    catalogs: dict[str, list[dict[str, Any]]],
+    synced_at: str,
+) -> list[dict[str, Any]]:
+    (
+        product_type_map,
+        product_map,
+        variant_map,
+    ) = build_catalog_maps(
+        catalogs
+    )
+
+    grouped: dict[
+        tuple[
+            str,
+            str,
+            int,
+            str,
+            int | None,
+            str | None,
+            str,
+        ],
+        dict[str, Any],
+    ] = {}
+
+    for product_row in product_rows:
+        resolution = resolve_category(
+            product_row.get("variant_id"),
+            variant_map=variant_map,
+            product_map=product_map,
+            product_type_map=product_type_map,
+        )
+
+        fecha = str(
+            product_row.get("fecha") or ""
+        )
+
+        periodo = str(
+            product_row.get("periodo") or ""
+        )
+
+        office_id = to_int(
+            product_row.get("office_id")
+        )
+
+        sucursal = str(
+            product_row.get("sucursal") or ""
+        ).strip()
+
+        product_type_id = resolution[
+            "product_type_id"
+        ]
+
+        product_type_name = resolution[
+            "product_type_name"
+        ]
+
+        resolution_status = resolution[
+            "resolution_status"
+        ]
+
+        key = (
+            fecha,
+            periodo,
+            office_id,
+            sucursal,
+            product_type_id,
+            product_type_name,
+            resolution_status,
+        )
+
+        if key not in grouped:
+            grouped[key] = {
+                "fecha": fecha,
+                "periodo": periodo,
+                "office_id": office_id,
+                "sucursal": sucursal,
+                "product_type_id": product_type_id,
+                "product_type_name": (
+                    product_type_name
+                ),
+                "resolution_status": (
+                    resolution_status
+                ),
+                "piezas": to_decimal(0),
+                "venta_total": to_decimal(0),
+                "net_amount": to_decimal(0),
+                "tax_amount": to_decimal(0),
+                "source_variant_rows": 0,
+            }
+
+        aggregate = grouped[key]
+
+        aggregate["piezas"] += to_decimal(
+            product_row.get("piezas")
+        )
+
+        aggregate["venta_total"] += to_decimal(
+            product_row.get("venta_total")
+        )
+
+        aggregate["net_amount"] += to_decimal(
+            product_row.get("net_amount")
+        )
+
+        aggregate["tax_amount"] += to_decimal(
+            product_row.get("tax_amount")
+        )
+
+        aggregate[
+            "source_variant_rows"
+        ] += 1
+
+    category_rows: list[
+        dict[str, Any]
+    ] = []
+
+    for aggregate in grouped.values():
+        category_rows.append(
+            {
+                "fecha": aggregate[
+                    "fecha"
+                ],
+                "periodo": aggregate[
+                    "periodo"
+                ],
+                "office_id": aggregate[
+                    "office_id"
+                ],
+                "sucursal": aggregate[
+                    "sucursal"
+                ],
+                "product_type_id": aggregate[
+                    "product_type_id"
+                ],
+                "product_type_name": (
+                    aggregate[
+                        "product_type_name"
+                    ]
+                ),
+                "resolution_status": (
+                    aggregate[
+                        "resolution_status"
+                    ]
+                ),
+                "piezas": number(
+                    js_round_decimal(
+                        aggregate["piezas"],
+                        4,
+                    )
+                ),
+                "venta_total": number(
+                    js_round_decimal(
+                        aggregate[
+                            "venta_total"
+                        ],
+                        2,
+                    )
+                ),
+                "net_amount": number(
+                    js_round_decimal(
+                        aggregate[
+                            "net_amount"
+                        ],
+                        2,
+                    )
+                ),
+                "tax_amount": number(
+                    js_round_decimal(
+                        aggregate[
+                            "tax_amount"
+                        ],
+                        2,
+                    )
+                ),
+                "source_variant_rows": (
+                    aggregate[
+                        "source_variant_rows"
+                    ]
+                ),
+                "synced_at": synced_at,
+            }
+        )
+
+    category_rows.sort(
+        key=lambda row: (
+            str(row.get("fecha") or ""),
+            to_int(row.get("office_id")),
+            str(
+                row.get(
+                    "resolution_status"
+                )
+                or ""
+            ),
+            to_int(
+                row.get(
+                    "product_type_id"
+                )
+            ),
+        )
+    )
+
+    return category_rows
+
+
+def validate_categories_daily_summary(
+    product_rows: list[dict[str, Any]],
+    category_rows: list[dict[str, Any]],
+) -> dict[str, Any]:
+    source_totals: dict[
+        tuple[str, int],
+        dict[str, Any],
+    ] = defaultdict(
+        lambda: {
+            "piezas": to_decimal(0),
+            "venta_total": to_decimal(0),
+            "net_amount": to_decimal(0),
+            "tax_amount": to_decimal(0),
+        }
+    )
+
+    category_totals: dict[
+        tuple[str, int],
+        dict[str, Any],
+    ] = defaultdict(
+        lambda: {
+            "piezas": to_decimal(0),
+            "venta_total": to_decimal(0),
+            "net_amount": to_decimal(0),
+            "tax_amount": to_decimal(0),
+        }
+    )
+
+    for row in product_rows:
+        key = (
+            str(row.get("fecha") or ""),
+            to_int(row.get("office_id")),
+        )
+
+        source_totals[key][
+            "piezas"
+        ] += to_decimal(
+            row.get("piezas")
+        )
+
+        source_totals[key][
+            "venta_total"
+        ] += to_decimal(
+            row.get("venta_total")
+        )
+
+        source_totals[key][
+            "net_amount"
+        ] += to_decimal(
+            row.get("net_amount")
+        )
+
+        source_totals[key][
+            "tax_amount"
+        ] += to_decimal(
+            row.get("tax_amount")
+        )
+
+    for row in category_rows:
+        key = (
+            str(row.get("fecha") or ""),
+            to_int(row.get("office_id")),
+        )
+
+        category_totals[key][
+            "piezas"
+        ] += to_decimal(
+            row.get("piezas")
+        )
+
+        category_totals[key][
+            "venta_total"
+        ] += to_decimal(
+            row.get("venta_total")
+        )
+
+        category_totals[key][
+            "net_amount"
+        ] += to_decimal(
+            row.get("net_amount")
+        )
+
+        category_totals[key][
+            "tax_amount"
+        ] += to_decimal(
+            row.get("tax_amount")
+        )
+
+    partition_keys = sorted(
+        set(source_totals)
+        | set(category_totals)
+    )
+
+    partitions: list[
+        dict[str, Any]
+    ] = []
+
+    mismatch_count = 0
+
+    for fecha, office_id in partition_keys:
+        key = (
+            fecha,
+            office_id,
+        )
+
+        source = source_totals[key]
+        target = category_totals[key]
+
+        piezas_difference = (
+            js_round_decimal(
+                target["piezas"]
+                - source["piezas"],
+                4,
+            )
+        )
+
+        venta_total_difference = (
+            js_round_decimal(
+                target["venta_total"]
+                - source["venta_total"],
+                2,
+            )
+        )
+
+        net_amount_difference = (
+            js_round_decimal(
+                target["net_amount"]
+                - source["net_amount"],
+                2,
+            )
+        )
+
+        tax_amount_difference = (
+            js_round_decimal(
+                target["tax_amount"]
+                - source["tax_amount"],
+                2,
+            )
+        )
+
+        differences = {
+            "piezas": number(
+                piezas_difference
+            ),
+            "venta_total": number(
+                venta_total_difference
+            ),
+            "net_amount": number(
+                net_amount_difference
+            ),
+            "tax_amount": number(
+                tax_amount_difference
+            ),
+        }
+
+        partition_status = (
+            "OK"
+            if all(
+                difference == 0
+                for difference
+                in differences.values()
+            )
+            else "MISMATCH"
+        )
+
+        if (
+            partition_status
+            == "MISMATCH"
+        ):
+            mismatch_count += 1
+
+        partitions.append(
+            {
+                "fecha": fecha,
+                "office_id": office_id,
+                "status": (
+                    partition_status
+                ),
+                "differences": (
+                    differences
+                ),
+            }
+        )
+
+    unresolved_category_rows = sum(
+        1
+        for row in category_rows
+        if row.get(
+            "resolution_status"
+        )
+        != "OK"
+    )
+
+    return {
+        "status": (
+            "OK"
+            if mismatch_count == 0
+            else "ERROR"
+        ),
+        "partition_count": len(
+            partitions
+        ),
+        "mismatch_count": (
+            mismatch_count
+        ),
+        "unresolved_category_rows": (
+            unresolved_category_rows
+        ),
+        "partitions": partitions,
+    }
+
+
+def resolution_counts(
+    category_rows: list[dict[str, Any]],
+) -> dict[str, int]:
+    counts: dict[str, int] = {}
+
+    for row in category_rows:
+        status = str(
+            row.get(
+                "resolution_status"
+            )
+            or "UNKNOWN"
+        )
+
+        counts[status] = (
+            counts.get(status, 0) + 1
+        )
+
+    return dict(
+        sorted(
+            counts.items()
+        )
+    )
+
+
+def build_payload(
+    products_payload: dict[str, Any],
+    catalogs_payload: dict[str, Any],
+) -> dict[str, Any]:
+    product_rows = products_payload.get(
+        "summary_rows"
+    )
+
+    if not isinstance(
+        product_rows,
+        list,
+    ):
+        raise ValueError(
+            "products_payload.summary_rows "
+            "debe ser una lista."
+        )
+
+    required_catalog_keys = (
+        "product_types",
+        "products",
+        "variants",
+    )
+
+    for key in required_catalog_keys:
+        if key not in catalogs_payload:
+            raise ValueError(
+                f"catalogs_payload.{key} es requerido."
+            )
+
+    product_types = catalogs_payload[
+        "product_types"
+    ]
+
+    products = catalogs_payload[
+        "products"
+    ]
+
+    variants = catalogs_payload[
+        "variants"
+    ]
+
+    if not isinstance(
+        product_types,
+        list,
+    ):
+        raise ValueError(
+            "catalogs_payload.product_types "
+            "debe ser una lista."
+        )
+
+    if not isinstance(
+        products,
+        list,
+    ):
+        raise ValueError(
+            "catalogs_payload.products "
+            "debe ser una lista."
+        )
+
+    if not isinstance(
+        variants,
+        list,
+    ):
+        raise ValueError(
+            "catalogs_payload.variants "
+            "debe ser una lista."
+        )
+
+    catalogs = {
+        "product_types": (
+            product_types
+        ),
+        "products": products,
+        "variants": variants,
+    }
+
+    synced_at = (
+        datetime.now(
+            timezone.utc
+        ).strftime(
+            "%Y-%m-%d %H:%M:%S"
+        )
+    )
+
+    category_rows = (
+        build_categories_daily_summary(
+            product_rows,
+            catalogs,
+            synced_at,
+        )
+    )
+
+    validation = (
+        validate_categories_daily_summary(
+            product_rows,
+            category_rows,
+        )
+    )
+
+    counts = resolution_counts(
+        category_rows
+    )
+
+    unresolved_count = sum(
+        count
+        for resolution_status, count
+        in counts.items()
+        if resolution_status != "OK"
+    )
+
+    products_status = str(
+        products_payload.get(
+            "status"
+        )
+        or ""
+    ).upper()
+
+    catalogs_status = str(
+        catalogs_payload.get(
+            "status"
+        )
+        or ""
+    ).upper()
+
+    if (
+        products_status == "ERROR"
+        or catalogs_status == "ERROR"
+        or validation["status"]
+        == "ERROR"
+    ):
+        status = "ERROR"
+
+    elif (
+        products_status
+        == "OK_WITH_REVIEW"
+        or catalogs_status
+        == "OK_WITH_REVIEW"
+        or unresolved_count > 0
+    ):
+        status = "OK_WITH_REVIEW"
+
+    else:
+        status = "OK"
+
+    return {
+        "status": status,
+        "start_date": (
+            products_payload.get(
+                "start_date"
+            )
+        ),
+        "end_date": (
+            products_payload.get(
+                "end_date"
+            )
+        ),
+        "generated_at_utc": (
+            synced_at
+        ),
+        "source_products_status": (
+            products_status
+        ),
+        "source_catalogs_status": (
+            catalogs_status
+        ),
+        "source_product_rows_count": (
+            len(product_rows)
+        ),
+        "category_rows_count": (
+            len(category_rows)
+        ),
+        "resolution_counts": counts,
+        "validation": validation,
+        "summary_rows": (
+            category_rows
+        ),
+    }
+
+
+def load_json(
+    path: Path,
+) -> dict[str, Any]:
+    payload = json.loads(
+        path.read_text(
+            encoding="utf-8"
+        )
+    )
+
+    if not isinstance(
+        payload,
+        dict,
+    ):
+        raise ValueError(
+            f"El JSON raíz debe ser "
+            f"un objeto: {path}"
+        )
+
+    return payload
+
+
+def output_filename(
+    payload: dict[str, Any],
+) -> str:
+    start_date = str(
+        payload.get(
+            "start_date"
+        )
+        or ""
+    ).strip()
+
+    end_date = str(
+        payload.get(
+            "end_date"
+        )
+        or ""
+    ).strip()
+
+    if not start_date:
+        return (
+            "categorias_sin_fecha.json"
+        )
+
+    if (
+        not end_date
+        or start_date == end_date
+    ):
+        return (
+            f"categorias_"
+            f"{start_date}.json"
+        )
+
+    return (
+        f"categorias_"
+        f"{start_date}_"
+        f"{end_date}.json"
+    )
+
+
+def write_output(
+    payload: dict[str, Any],
+    *,
+    output_dir: Path,
+) -> Path:
+    output_dir.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    output_path = (
+        output_dir
+        / output_filename(
+            payload
+        )
+    )
+
+    output_path.write_text(
+        json.dumps(
+            payload,
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+    return output_path
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Construye el resumen diario "
+            "de categorías a partir del "
+            "resumen de Products y los "
+            "catálogos de categorías."
+        )
+    )
+
+    parser.add_argument(
+        "--products-file",
+        required=True,
+        help=(
+            "JSON generado por "
+            "src.extract_products."
+        ),
+    )
+
+    parser.add_argument(
+        "--catalogs-file",
+        required=True,
+        help=(
+            "JSON generado por "
+            "src.extract_category_catalogs."
+        ),
+    )
+
+    parser.add_argument(
+        "--output-dir",
+        default="output",
+        help=(
+            "Directorio donde se "
+            "escribirá el artefacto JSON."
+        ),
+    )
+
+    return parser
+
+
+def main() -> int:
+    args = build_parser().parse_args()
+
+    products_payload = load_json(
+        Path(
+            args.products_file
+        )
+    )
+
+    catalogs_payload = load_json(
+        Path(
+            args.catalogs_file
+        )
+    )
+
+    payload = build_payload(
+        products_payload,
+        catalogs_payload,
+    )
+
+    output_path = write_output(
+        payload,
+        output_dir=Path(
+            args.output_dir
+        ),
+    )
+
+    validation = payload[
+        "validation"
+    ]
+
+    execution_summary = {
+        "status": payload[
+            "status"
+        ],
+        "source_product_rows_count": (
+            payload[
+                "source_product_rows_count"
+            ]
+        ),
+        "category_rows_count": (
+            payload[
+                "category_rows_count"
+            ]
+        ),
+        "resolution_counts": (
+            payload[
+                "resolution_counts"
+            ]
+        ),
+        "reconciliation_status": (
+            validation[
+                "status"
+            ]
+        ),
+        "mismatch_count": (
+            validation[
+                "mismatch_count"
+            ]
+        ),
+        "output_file": str(
+            output_path
+        ),
+    }
+
+    print(
+        json.dumps(
+            execution_summary,
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
+
+    return (
+        1
+        if payload["status"]
+        == "ERROR"
+        else 0
+    )
+
+
+if __name__ == "__main__":
+    raise SystemExit(
+        main()
+    )
