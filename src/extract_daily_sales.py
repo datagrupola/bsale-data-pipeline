@@ -22,6 +22,7 @@ from .config import (
     TIMEZONE,
     get_bsale_token,
 )
+from .db import get_db_connection
 
 LOGGER = logging.getLogger("bsale.daily_sales")
 MONEY_QUANTUM = Decimal("0.01")
@@ -52,7 +53,9 @@ def parse_ymd(value: str) -> date:
         ) from exc
 
     if parsed.strftime("%Y-%m-%d") != value:
-        raise ValueError(f"Invalid date '{value}'. Expected YYYY-MM-DD.")
+        raise ValueError(
+            f"Invalid date '{value}'. Expected YYYY-MM-DD."
+        )
 
     return parsed
 
@@ -75,7 +78,11 @@ def bsale_emission_date_range(target_date: date) -> str:
         time(23, 59, 59),
         tzinfo=timezone.utc,
     )
-    return f"[{int(start_utc.timestamp())},{int(end_utc.timestamp())}]"
+
+    return (
+        f"[{int(start_utc.timestamp())},"
+        f"{int(end_utc.timestamp())}]"
+    )
 
 
 def bsale_record_date(target_date: date) -> int:
@@ -87,14 +94,20 @@ def bsale_record_date(target_date: date) -> int:
     return int(start_utc.timestamp())
 
 
-def value_from_keys(payload: dict[str, Any], *keys: str) -> Any:
+def value_from_keys(
+    payload: dict[str, Any],
+    *keys: str,
+) -> Any:
     for key in keys:
         if key in payload:
             return payload[key]
     return None
 
 
-def id_from_href(href: Any, resource_name: str) -> int | None:
+def id_from_href(
+    href: Any,
+    resource_name: str,
+) -> int | None:
     if not href:
         return None
 
@@ -112,6 +125,7 @@ def document_id(document: dict[str, Any]) -> int | None:
         "document_id",
         "documentId",
     )
+
     if value is not None:
         try:
             return int(value)
@@ -147,6 +161,7 @@ def document_type_id(document: dict[str, Any]) -> int | None:
         "document_type_id",
         "documentTypeId",
     )
+
     try:
         return int(value) if value is not None else None
     except (TypeError, ValueError):
@@ -186,6 +201,7 @@ def payment_document_id(payment: dict[str, Any]) -> int | None:
         "document_id",
         "documentId",
     )
+
     try:
         return int(value) if value is not None else None
     except (TypeError, ValueError):
@@ -218,6 +234,7 @@ def payment_type_id(payment: dict[str, Any]) -> int | None:
         "payment_type_id",
         "paymentTypeId",
     )
+
     try:
         return int(value) if value is not None else None
     except (TypeError, ValueError):
@@ -226,6 +243,7 @@ def payment_type_id(payment: dict[str, Any]) -> int | None:
 
 def payment_state(payment: dict[str, Any]) -> int:
     value = payment.get("state", 0)
+
     try:
         return int(value)
     except (TypeError, ValueError):
@@ -516,6 +534,7 @@ def write_output(
     output_dir: Path,
 ) -> Path:
     output_dir.mkdir(parents=True, exist_ok=True)
+
     output_path = (
         output_dir
         / f"ventas_diarias_{target_date.isoformat()}.json"
@@ -536,7 +555,81 @@ def write_output(
         ),
         encoding="utf-8",
     )
+
     return output_path
+
+
+def persist_daily_sales(rows: list[dict[str, Any]]) -> int:
+    """Inserta o actualiza las ventas diarias en PostgreSQL."""
+    if not rows:
+        return 0
+
+    sql = """
+        insert into public.daily_sales (
+            sale_date,
+            office_id,
+            office_name,
+            cash_amount,
+            card_amount,
+            flux_amount,
+            gross_sales,
+            returns_amount,
+            net_sales,
+            tickets_count,
+            pieces_sold,
+            source_updated_at,
+            synced_at
+        )
+        values (
+            %(sale_date)s,
+            %(office_id)s,
+            %(office_name)s,
+            %(cash_amount)s,
+            %(card_amount)s,
+            %(flux_amount)s,
+            %(gross_sales)s,
+            %(returns_amount)s,
+            %(net_sales)s,
+            %(tickets_count)s,
+            %(pieces_sold)s,
+            now(),
+            now()
+        )
+        on conflict (sale_date, office_id) do update set
+            office_name = excluded.office_name,
+            cash_amount = excluded.cash_amount,
+            card_amount = excluded.card_amount,
+            flux_amount = excluded.flux_amount,
+            gross_sales = excluded.gross_sales,
+            returns_amount = excluded.returns_amount,
+            net_sales = excluded.net_sales,
+            tickets_count = excluded.tickets_count,
+            source_updated_at = now(),
+            synced_at = now()
+    """
+
+    records = [
+        {
+            "sale_date": row["fecha"],
+            "office_id": row["office_id"],
+            "office_name": row["sucursal"],
+            "cash_amount": row["efectivo"],
+            "card_amount": row["terminal"],
+            "flux_amount": row["flux"],
+            "gross_sales": row["venta_bruta"],
+            "returns_amount": row["devoluciones"],
+            "net_sales": row["venta_neta"],
+            "tickets_count": row["documentos_venta"],
+            "pieces_sold": 0,
+        }
+        for row in rows
+    ]
+
+    with get_db_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.executemany(sql, records)
+
+    return len(records)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -561,6 +654,12 @@ def build_parser() -> argparse.ArgumentParser:
             "written."
         ),
     )
+    parser.add_argument(
+        "--write-db",
+        action="store_true",
+        help="Persiste el resumen diario en PostgreSQL.",
+    )
+
     return parser
 
 
@@ -587,6 +686,7 @@ def main() -> int:
         client,
         target_date,
     )
+
     output_path = write_output(
         target_date,
         rows,
@@ -594,10 +694,19 @@ def main() -> int:
         Path(args.output_dir),
     )
 
+    database_rows_written = 0
+    if args.write_db:
+        database_rows_written = persist_daily_sales(rows)
+        LOGGER.info(
+            "Persisted %s daily-sales rows to PostgreSQL",
+            database_rows_written,
+        )
+
     summary = {
         "status": "OK",
         "date": target_date.isoformat(),
         "rows_written": len(rows),
+        "database_rows_written": database_rows_written,
         "payments_read": metadata["payments_read"],
         "documents_read": sum(
             office["documents_read"]

@@ -20,6 +20,7 @@ from .config import (
     PAGE_LIMIT,
     get_bsale_token,
 )
+from .db import get_db_connection
 
 
 LOGGER = logging.getLogger("bsale.products")
@@ -1420,6 +1421,83 @@ def write_output(
     return output_path
 
 
+def persist_daily_pieces(
+    summary_rows: Iterable[dict[str, Any]],
+) -> dict[str, int]:
+    """Actualiza únicamente ``pieces_sold`` en ``daily_sales``.
+
+    Cada partición de productos debe corresponder a una fila existente de
+    ventas diarias con la llave ``(sale_date, office_id)``. Si falta alguna,
+    se cancela toda la transacción para evitar una actualización parcial.
+    """
+    grouped: dict[tuple[str, int], Decimal] = defaultdict(
+        lambda: Decimal("0")
+    )
+
+    for row in summary_rows:
+        key = (
+            str(row["fecha"]),
+            to_int(row["office_id"]),
+        )
+        grouped[key] += to_decimal(row["piezas"])
+
+    records = [
+        {
+            "sale_date": sale_date,
+            "office_id": office_id,
+            "pieces_sold": number(
+                js_round_decimal(pieces, 4)
+            ),
+        }
+        for (sale_date, office_id), pieces in sorted(
+            grouped.items()
+        )
+    ]
+
+    if not records:
+        return {
+            "target_rows": 0,
+            "updated_rows": 0,
+            "missing_daily_sales_rows": 0,
+        }
+
+    sql = """
+        update public.daily_sales
+        set
+            pieces_sold = %(pieces_sold)s,
+            synced_at = now()
+        where sale_date = %(sale_date)s
+          and office_id = %(office_id)s
+    """
+
+    updated_rows = 0
+    missing_records: list[dict[str, Any]] = []
+
+    with get_db_connection() as connection:
+        with connection.cursor() as cursor:
+            for record in records:
+                cursor.execute(sql, record)
+
+                if cursor.rowcount == 1:
+                    updated_rows += 1
+                else:
+                    missing_records.append(record)
+
+            if missing_records:
+                raise RuntimeError(
+                    "No se actualizó daily_sales porque faltan "
+                    "particiones base para piezas. La transacción "
+                    "se revirtió. Faltantes: "
+                    f"{missing_records}"
+                )
+
+    return {
+        "target_rows": len(records),
+        "updated_rows": updated_rows,
+        "missing_daily_sales_rows": 0,
+    }
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
@@ -1487,6 +1565,16 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
 
+    parser.add_argument(
+        "--write-db",
+        action="store_true",
+        help=(
+            "Actualiza pieces_sold en daily_sales. "
+            "Sólo permite escritura si toda la extracción "
+            "queda validada."
+        ),
+    )
+
     return parser
 
 
@@ -1538,6 +1626,29 @@ def main() -> int:
         ),
     )
 
+    database_result = {
+        "target_rows": 0,
+        "updated_rows": 0,
+        "missing_daily_sales_rows": 0,
+    }
+
+    if args.write_db:
+        if payload["status"] != "OK":
+            raise RuntimeError(
+                "No se actualizó daily_sales porque la "
+                "extracción de productos no quedó totalmente "
+                f"validada. status={payload['status']}"
+            )
+
+        database_result = persist_daily_pieces(
+            payload["summary_rows"]
+        )
+
+        LOGGER.info(
+            "Persisted pieces for %s daily-sales rows",
+            database_result["updated_rows"],
+        )
+
     filename = output_filename(
         start_date,
         end_date,
@@ -1576,6 +1687,7 @@ def main() -> int:
                 "validation_review_count"
             ]
         ),
+        "database_pieces": database_result,
         "output_file": str(output_path),
     }
 
