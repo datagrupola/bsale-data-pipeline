@@ -15,6 +15,7 @@ from .config import (
     VARIANTS_ENDPOINT,
     get_bsale_token,
 )
+from .db import get_db_connection
 
 
 LOGGER = logging.getLogger(__name__)
@@ -380,6 +381,71 @@ def write_output(
     return output_path
 
 
+def persist_category_catalogs(payload: dict[str, Any]) -> dict[str, int]:
+    """Upsert validated catalog entities without deleting historic entries.
+
+    The tables are intentionally maintained independently from sales.  This
+    avoids making a daily-sales partition depend on an API catalog refresh.
+    """
+    if payload.get("status") != "OK":
+        raise RuntimeError(
+            "No se actualizan los catálogos porque Bsale los reportó con "
+            f"revisión pendiente. status={payload.get('status')}"
+        )
+
+    type_sql = """
+        insert into public.category_product_types
+            (product_type_id, product_type_name, is_active, synced_at)
+        values (%(product_type_id)s, %(product_type_name)s,
+                %(is_active)s, %(synced_at)s)
+        on conflict (product_type_id) do update set
+            product_type_name = excluded.product_type_name,
+            is_active = excluded.is_active,
+            synced_at = excluded.synced_at
+    """
+    product_sql = """
+        insert into public.category_products
+            (product_id, product_name, product_type_id, is_active, synced_at)
+        values (%(product_id)s, %(product_name)s, %(product_type_id)s,
+                %(is_active)s, %(synced_at)s)
+        on conflict (product_id) do update set
+            product_name = excluded.product_name,
+            product_type_id = excluded.product_type_id,
+            is_active = excluded.is_active,
+            synced_at = excluded.synced_at
+    """
+    variant_sql = """
+        insert into public.category_variants
+            (variant_id, variant_code, variant_description, product_id,
+             is_active, synced_at)
+        values (%(variant_id)s, %(variant_code)s, %(variant_description)s,
+                %(product_id)s, %(is_active)s, %(synced_at)s)
+        on conflict (variant_id) do update set
+            variant_code = excluded.variant_code,
+            variant_description = excluded.variant_description,
+            product_id = excluded.product_id,
+            is_active = excluded.is_active,
+            synced_at = excluded.synced_at
+    """
+
+    def record(row: dict[str, Any]) -> dict[str, Any]:
+        return {**row, "is_active": to_int(row.get("state")) == 0}
+
+    counts = {name: 0 for name in CATALOG_NAMES}
+    with get_db_connection() as connection:
+        with connection.cursor() as cursor:
+            for row in payload["product_types"]:
+                cursor.execute(type_sql, record(row))
+                counts["product_types"] += cursor.rowcount
+            for row in payload["products"]:
+                cursor.execute(product_sql, record(row))
+                counts["products"] += cursor.rowcount
+            for row in payload["variants"]:
+                cursor.execute(variant_sql, record(row))
+                counts["variants"] += cursor.rowcount
+    return counts
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
@@ -394,6 +460,15 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Directorio donde se escribirá "
             "el artefacto JSON."
+        ),
+    )
+
+    parser.add_argument(
+        "--write-db",
+        action="store_true",
+        help=(
+            "Hace upsert de los tres catálogos en Neon. Sólo se permite "
+            "cuando la validación del catálogo es OK."
         ),
     )
 
@@ -421,6 +496,11 @@ def main() -> int:
     )
 
     payload = build_payload(client)
+
+    database_result = None
+    if args.write_db:
+        database_result = persist_category_catalogs(payload)
+        LOGGER.info("Persisted category catalogs: %s", database_result)
 
     output_path = write_output(
         payload,
@@ -452,6 +532,7 @@ def main() -> int:
         ),
         "review_count": validation["review_count"],
         "output_file": str(output_path),
+        "database": database_result,
     }
 
     print(
