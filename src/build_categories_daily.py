@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 from collections import defaultdict
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -944,9 +944,12 @@ def database_rows(category_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return records
 
 
-def persist_categories_daily(category_rows: list[dict[str, Any]]) -> dict[str, int]:
+def persist_categories_daily(
+    category_rows: list[dict[str, Any]],
+    *,
+    target_partitions: set[tuple[str, int]],
+) -> dict[str, int]:
     records = database_rows(category_rows)
-    partitions = {(r["sale_date"], r["office_id"]) for r in records}
     delete_sql = "delete from public.categories_daily where sale_date = %(sale_date)s and office_id = %(office_id)s"
     insert_sql = """
         insert into public.categories_daily
@@ -961,7 +964,7 @@ def persist_categories_daily(category_rows: list[dict[str, Any]]) -> dict[str, i
     deleted = inserted = 0
     with get_db_connection() as connection:
         with connection.cursor() as cursor:
-            for sale_date, office_id in sorted(partitions):
+            for sale_date, office_id in sorted(target_partitions):
                 cursor.execute(delete_sql, {"sale_date": sale_date, "office_id": office_id})
                 deleted += cursor.rowcount
             for record in records:
@@ -1049,7 +1052,17 @@ def main() -> int:
     if args.write_db:
         if payload["validation"]["status"] != "OK":
             raise RuntimeError("No se escribió categories_daily: el cuadre no es exacto.")
-        database_result = persist_categories_daily(payload["summary_rows"])
+        office_ids = args.office_id or [2, 3, 4]
+        current_date = start
+        target_partitions: set[tuple[str, int]] = set()
+        while current_date <= end:
+            target_partitions.update(
+                (current_date.isoformat(), office_id) for office_id in office_ids
+            )
+            current_date += timedelta(days=1)
+        database_result = persist_categories_daily(
+            payload["summary_rows"], target_partitions=target_partitions
+        )
 
     output_path = write_output(
         payload,
