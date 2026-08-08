@@ -431,18 +431,34 @@ def persist_category_catalogs(payload: dict[str, Any]) -> dict[str, int]:
     def record(row: dict[str, Any]) -> dict[str, Any]:
         return {**row, "is_active": to_int(row.get("state")) == 0}
 
+    # ``cursor.execute()`` for every record turns a normal full catalog
+    # refresh (tens of thousands of products/variants) into tens of
+    # thousands of client/server round trips.  Use Psycopg's batched
+    # execution instead: the complete catalog is still one transaction, but
+    # it is sent to Neon in batches over the extended query protocol.
+    records_by_catalog = {
+        "product_types": [record(row) for row in payload["product_types"]],
+        "products": [record(row) for row in payload["products"]],
+        "variants": [record(row) for row in payload["variants"]],
+    }
+    statements = (
+        ("product_types", type_sql),
+        ("products", product_sql),
+        ("variants", variant_sql),
+    )
+
     counts = {name: 0 for name in CATALOG_NAMES}
     with get_db_connection() as connection:
         with connection.cursor() as cursor:
-            for row in payload["product_types"]:
-                cursor.execute(type_sql, record(row))
-                counts["product_types"] += cursor.rowcount
-            for row in payload["products"]:
-                cursor.execute(product_sql, record(row))
-                counts["products"] += cursor.rowcount
-            for row in payload["variants"]:
-                cursor.execute(variant_sql, record(row))
-                counts["variants"] += cursor.rowcount
+            for catalog_name, statement in statements:
+                records = records_by_catalog[catalog_name]
+                LOGGER.info(
+                    "Persisting %s category catalog rows in batch",
+                    len(records),
+                )
+                if records:
+                    cursor.executemany(statement, records)
+                counts[catalog_name] = len(records)
     return counts
 
 
