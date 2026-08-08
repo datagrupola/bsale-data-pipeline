@@ -6,7 +6,7 @@ import logging
 import re
 from collections import defaultdict
 from dataclasses import dataclass
-from datetime import date, datetime, time, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal, ROUND_FLOOR
 from pathlib import Path
 from typing import Any, Iterable
@@ -853,7 +853,7 @@ def build_summary(
     synced_at: str,
 ) -> list[dict[str, Any]]:
     grouped: dict[
-        tuple[str, str, int, str, int, str, str],
+        tuple[str, str, int, str, int],
         dict[str, Any],
     ] = {}
 
@@ -864,8 +864,6 @@ def build_summary(
             to_int(row["office_id"]),
             str(row["sucursal"]),
             to_int(row["variant_id"]),
-            str(row["variant_code"]),
-            str(row["variant_description"]),
         )
 
         if key not in grouped:
@@ -875,9 +873,13 @@ def build_summary(
                 "office_id": key[2],
                 "sucursal": key[3],
                 "variant_id": key[4],
-                "variant_code": key[5],
-                "variant_description": key[6],
+                "variant_code": str(row["variant_code"]),
+                "variant_description": str(
+                    row["variant_description"]
+                ),
                 "piezas": Decimal("0"),
+                "venta_bruta": Decimal("0"),
+                "devoluciones": Decimal("0"),
                 "venta_total": Decimal("0"),
                 "net_amount": Decimal("0"),
                 "tax_amount": Decimal("0"),
@@ -888,9 +890,14 @@ def build_summary(
             row["quantity_signed"]
         )
 
-        grouped[key]["venta_total"] += to_decimal(
-            row["total_amount_signed"]
-        )
+        signed_total = to_decimal(row["total_amount_signed"])
+
+        if signed_total >= 0:
+            grouped[key]["venta_bruta"] += signed_total
+        else:
+            grouped[key]["devoluciones"] += abs(signed_total)
+
+        grouped[key]["venta_total"] += signed_total
 
         grouped[key]["net_amount"] += to_decimal(
             row["net_amount_signed"]
@@ -920,6 +927,18 @@ def build_summary(
                     js_round_decimal(
                         item["piezas"],
                         4,
+                    )
+                ),
+                "venta_bruta": number(
+                    js_round_decimal(
+                        item["venta_bruta"],
+                        2,
+                    )
+                ),
+                "devoluciones": number(
+                    js_round_decimal(
+                        item["devoluciones"],
+                        2,
                     )
                 ),
                 "venta_total": number(
@@ -1498,6 +1517,129 @@ def persist_daily_pieces(
     }
 
 
+def persist_products_daily(
+    summary_rows: Iterable[dict[str, Any]],
+    *,
+    start_date: date,
+    end_date: date,
+    office_ids: Iterable[int],
+) -> dict[str, int]:
+    """Reemplaza el detalle de SKU de las particiones extraídas.
+
+    La llave de ``products_daily`` es ``(sale_date, office_id, variant_id)``.
+    Se eliminan primero las filas existentes de cada fecha/sucursal solicitada
+    y después se insertan las filas calculadas, dentro de la misma transacción.
+    Así, una recarga no duplica SKU ni conserva SKU obsoletos, incluso cuando
+    una sucursal no tuvo documentos en el periodo.
+    """
+    records: list[dict[str, Any]] = []
+    office_ids_list = sorted({to_int(value) for value in office_ids})
+    partitions = {
+        ((start_date + timedelta(days=offset)).isoformat(), office_id)
+        for offset in range((end_date - start_date).days + 1)
+        for office_id in office_ids_list
+    }
+
+    for row in summary_rows:
+        variant_id = to_int(row["variant_id"])
+        description = str(row["variant_description"] or "").strip()
+        pieces = js_round_decimal(row["piezas"], 4)
+
+        if variant_id <= 0:
+            raise RuntimeError(
+                "No se puede persistir products_daily: variant_id inválido. "
+                f"Fila: {row}"
+            )
+
+        # Bsale puede entregar una variante válida sin descripción expandida.
+        # Conservamos la venta y dejamos una marca auditable, sin inventar
+        # datos de catálogo ni bloquear la recarga completa de la fecha.
+        if not description:
+            description = "N/A (sin descripción en Bsale)"
+
+        if pieces != pieces.to_integral_value():
+            raise RuntimeError(
+                "No se puede persistir products_daily: la columna "
+                "pieces_sold de Neon es integer y Bsale devolvió una cantidad "
+                f"decimal ({pieces}) para variant_id={variant_id}."
+            )
+
+        sale_date = str(row["fecha"])
+        office_id = to_int(row["office_id"])
+        records.append(
+            {
+                "sale_date": sale_date,
+                "office_id": office_id,
+                "office_name": str(row["sucursal"]),
+                "variant_id": variant_id,
+                "variant_code": str(row["variant_code"] or "") or None,
+                "variant_description": description,
+                "pieces_sold": int(pieces),
+                "gross_sales": number(
+                    js_round_decimal(row["venta_bruta"], 2)
+                ),
+                "returns_amount": number(
+                    js_round_decimal(row["devoluciones"], 2)
+                ),
+                "net_sales": number(
+                    js_round_decimal(row["venta_total"], 2)
+                ),
+                "tax_amount": number(
+                    js_round_decimal(row["tax_amount"], 2)
+                ),
+            }
+        )
+
+    delete_sql = """
+        delete from public.products_daily
+        where sale_date = %(sale_date)s
+          and office_id = %(office_id)s
+    """
+    insert_sql = """
+        insert into public.products_daily (
+            sale_date, office_id, office_name, variant_id, variant_code,
+            variant_description, pieces_sold, gross_sales, returns_amount,
+            net_sales, tax_amount, synced_at
+        ) values (
+            %(sale_date)s, %(office_id)s, %(office_name)s, %(variant_id)s,
+            %(variant_code)s, %(variant_description)s, %(pieces_sold)s,
+            %(gross_sales)s, %(returns_amount)s, %(net_sales)s,
+            %(tax_amount)s, now()
+        )
+    """
+
+    deleted_rows = 0
+    inserted_rows = 0
+
+    with get_db_connection() as connection:
+        with connection.cursor() as cursor:
+            for sale_date, office_id in sorted(partitions):
+                cursor.execute(
+                    delete_sql,
+                    {
+                        "sale_date": sale_date,
+                        "office_id": office_id,
+                    },
+                )
+                deleted_rows += cursor.rowcount
+
+            for record in records:
+                cursor.execute(insert_sql, record)
+                inserted_rows += cursor.rowcount
+
+    if inserted_rows != len(records):
+        raise RuntimeError(
+            "products_daily no confirmó todas las inserciones. "
+            f"Esperadas={len(records)}, insertadas={inserted_rows}."
+        )
+
+    return {
+        "target_rows": len(records),
+        "deleted_rows": deleted_rows,
+        "inserted_rows": inserted_rows,
+    }
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
@@ -1569,7 +1711,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--write-db",
         action="store_true",
         help=(
-            "Actualiza pieces_sold en daily_sales. "
+            "Reemplaza el detalle SKU en products_daily y "
+            "actualiza pieces_sold en daily_sales. "
             "Sólo permite escritura si toda la extracción "
             "queda validada."
         ),
@@ -1627,26 +1770,45 @@ def main() -> int:
     )
 
     database_result = {
-        "target_rows": 0,
-        "updated_rows": 0,
-        "missing_daily_sales_rows": 0,
+        "products_daily": {
+            "target_rows": 0,
+            "deleted_rows": 0,
+            "inserted_rows": 0,
+        },
+        "daily_sales": {
+            "target_rows": 0,
+            "updated_rows": 0,
+            "missing_daily_sales_rows": 0,
+        },
     }
 
     if args.write_db:
         if payload["status"] != "OK":
             raise RuntimeError(
-                "No se actualizó daily_sales porque la "
+                "No se actualizó products_daily ni daily_sales porque la "
                 "extracción de productos no quedó totalmente "
                 f"validada. status={payload['status']}"
             )
 
-        database_result = persist_daily_pieces(
+        database_result["products_daily"] = (
+            persist_products_daily(
+                payload["summary_rows"],
+                start_date=start_date,
+                end_date=end_date,
+                office_ids=[
+                    office["office_id"]
+                    for office in payload["offices"]
+                ],
+            )
+        )
+        database_result["daily_sales"] = persist_daily_pieces(
             payload["summary_rows"]
         )
 
         LOGGER.info(
-            "Persisted pieces for %s daily-sales rows",
-            database_result["updated_rows"],
+            "Persisted %s product rows and pieces for %s daily-sales rows",
+            database_result["products_daily"]["inserted_rows"],
+            database_result["daily_sales"]["updated_rows"],
         )
 
     filename = output_filename(
@@ -1687,7 +1849,7 @@ def main() -> int:
                 "validation_review_count"
             ]
         ),
-        "database_pieces": database_result,
+        "database": database_result,
         "output_file": str(output_path),
     }
 
