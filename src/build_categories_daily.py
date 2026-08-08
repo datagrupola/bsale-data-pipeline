@@ -7,11 +7,16 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from psycopg.rows import dict_row
+
 from .extract_products import (
+    ensure_valid_range,
     js_round_decimal,
     number,
+    parse_ymd,
     to_decimal,
 )
+from .db import get_db_connection
 
 
 def to_int(value: Any) -> int:
@@ -237,6 +242,7 @@ def build_categories_daily_summary(
                 ),
                 "piezas": to_decimal(0),
                 "venta_total": to_decimal(0),
+                "returns_amount": to_decimal(0),
                 "net_amount": to_decimal(0),
                 "tax_amount": to_decimal(0),
                 "source_variant_rows": 0,
@@ -250,6 +256,10 @@ def build_categories_daily_summary(
 
         aggregate["venta_total"] += to_decimal(
             product_row.get("venta_total")
+        )
+
+        aggregate["returns_amount"] += to_decimal(
+            product_row.get("returns_amount")
         )
 
         aggregate["net_amount"] += to_decimal(
@@ -310,6 +320,11 @@ def build_categories_daily_summary(
                         2,
                     )
                 ),
+                "returns_amount": number(
+                    js_round_decimal(
+                        aggregate["returns_amount"], 2
+                    )
+                ),
                 "net_amount": number(
                     js_round_decimal(
                         aggregate[
@@ -367,6 +382,7 @@ def validate_categories_daily_summary(
         lambda: {
             "piezas": to_decimal(0),
             "venta_total": to_decimal(0),
+            "returns_amount": to_decimal(0),
             "net_amount": to_decimal(0),
             "tax_amount": to_decimal(0),
         }
@@ -379,6 +395,7 @@ def validate_categories_daily_summary(
         lambda: {
             "piezas": to_decimal(0),
             "venta_total": to_decimal(0),
+            "returns_amount": to_decimal(0),
             "net_amount": to_decimal(0),
             "tax_amount": to_decimal(0),
         }
@@ -400,6 +417,9 @@ def validate_categories_daily_summary(
             "venta_total"
         ] += to_decimal(
             row.get("venta_total")
+        )
+        source_totals[key]["returns_amount"] += to_decimal(
+            row.get("returns_amount")
         )
 
         source_totals[key][
@@ -430,6 +450,9 @@ def validate_categories_daily_summary(
             "venta_total"
         ] += to_decimal(
             row.get("venta_total")
+        )
+        category_totals[key]["returns_amount"] += to_decimal(
+            row.get("returns_amount")
         )
 
         category_totals[key][
@@ -479,6 +502,9 @@ def validate_categories_daily_summary(
                 2,
             )
         )
+        returns_amount_difference = js_round_decimal(
+            target["returns_amount"] - source["returns_amount"], 2
+        )
 
         net_amount_difference = (
             js_round_decimal(
@@ -503,6 +529,7 @@ def validate_categories_daily_summary(
             "venta_total": number(
                 venta_total_difference
             ),
+            "returns_amount": number(returns_amount_difference),
             "net_amount": number(
                 net_amount_difference
             ),
@@ -859,6 +886,92 @@ def write_output(
     return output_path
 
 
+def fetch_products_and_catalogs(
+    *, start_date: str, end_date: str, office_ids: list[int] | None
+) -> tuple[list[dict[str, Any]], dict[str, list[dict[str, Any]]]]:
+    """Read the already validated SKU grain and catalog relations from Neon."""
+    office_filter = ""
+    params: dict[str, Any] = {"start_date": start_date, "end_date": end_date}
+    if office_ids:
+        office_filter = " and office_id = any(%(office_ids)s)"
+        params["office_ids"] = office_ids
+    products_sql = f"""
+        select sale_date as fecha, to_char(sale_date, 'YYYY-MM') as periodo,
+               office_id, office_name as sucursal, variant_id,
+               variant_code, variant_description, pieces_sold as piezas,
+               gross_sales as venta_total, returns_amount, net_sales as net_amount,
+               tax_amount
+        from public.products_daily
+        where sale_date between %(start_date)s and %(end_date)s {office_filter}
+        order by sale_date, office_id, variant_id
+    """
+    with get_db_connection() as connection:
+        with connection.cursor(row_factory=dict_row) as cursor:
+            cursor.execute(products_sql, params)
+            product_rows = list(cursor.fetchall())
+            cursor.execute("select product_type_id, product_type_name from public.category_product_types")
+            product_types = list(cursor.fetchall())
+            cursor.execute("select product_id, product_name, product_type_id from public.category_products")
+            products = list(cursor.fetchall())
+            cursor.execute("select variant_id, variant_code, variant_description, product_id from public.category_variants")
+            variants = list(cursor.fetchall())
+    for row in product_rows:
+        row["fecha"] = str(row["fecha"])
+    return product_rows, {"product_types": product_types, "products": products, "variants": variants}
+
+
+def database_rows(category_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    for row in category_rows:
+        resolution_status = str(row["resolution_status"])
+        product_type_id = row.get("product_type_id")
+        if resolution_status == "OK":
+            category_key = f"product_type:{product_type_id}"
+            category_name = str(row["product_type_name"])
+            db_status = "RESOLVED"
+        else:
+            category_key = f"{resolution_status}:unresolved"
+            category_name = f"N/A ({resolution_status})"
+            db_status = resolution_status
+        records.append({
+            "sale_date": row["fecha"], "office_id": row["office_id"],
+            "office_name": row["sucursal"], "category_key": category_key,
+            "category_name": category_name, "resolution_status": db_status,
+            "pieces_sold": row["piezas"], "gross_sales": row["venta_total"],
+            "returns_amount": row.get("returns_amount", 0),
+            "net_sales": row["net_amount"], "tax_amount": row["tax_amount"],
+        })
+    return records
+
+
+def persist_categories_daily(category_rows: list[dict[str, Any]]) -> dict[str, int]:
+    records = database_rows(category_rows)
+    partitions = {(r["sale_date"], r["office_id"]) for r in records}
+    delete_sql = "delete from public.categories_daily where sale_date = %(sale_date)s and office_id = %(office_id)s"
+    insert_sql = """
+        insert into public.categories_daily
+        (sale_date, office_id, office_name, category_key, category_name,
+         resolution_status, pieces_sold, gross_sales, returns_amount,
+         net_sales, tax_amount, synced_at)
+        values (%(sale_date)s, %(office_id)s, %(office_name)s, %(category_key)s,
+                %(category_name)s, %(resolution_status)s, %(pieces_sold)s,
+                %(gross_sales)s, %(returns_amount)s, %(net_sales)s,
+                %(tax_amount)s, now())
+    """
+    deleted = inserted = 0
+    with get_db_connection() as connection:
+        with connection.cursor() as cursor:
+            for sale_date, office_id in sorted(partitions):
+                cursor.execute(delete_sql, {"sale_date": sale_date, "office_id": office_id})
+                deleted += cursor.rowcount
+            for record in records:
+                cursor.execute(insert_sql, record)
+                inserted += cursor.rowcount
+    if inserted != len(records):
+        raise RuntimeError(f"categories_daily insertó {inserted} de {len(records)} filas.")
+    return {"target_rows": len(records), "deleted_rows": deleted, "inserted_rows": inserted}
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
@@ -871,7 +984,6 @@ def build_parser() -> argparse.ArgumentParser:
 
     parser.add_argument(
         "--products-file",
-        required=True,
         help=(
             "JSON generado por "
             "src.extract_products."
@@ -880,7 +992,6 @@ def build_parser() -> argparse.ArgumentParser:
 
     parser.add_argument(
         "--catalogs-file",
-        required=True,
         help=(
             "JSON generado por "
             "src.extract_category_catalogs."
@@ -896,28 +1007,49 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
 
+    parser.add_argument("--start-date", help="Fecha fiscal inicial YYYY-MM-DD para leer Neon.")
+    parser.add_argument("--end-date", help="Fecha fiscal final; por defecto start-date.")
+    parser.add_argument("--office-id", action="append", type=int,
+                        help="Sucursal a materializar; puede repetirse.")
+    parser.add_argument("--write-db", action="store_true",
+                        help="Lee products_daily y catálogos desde Neon y reemplaza categorías por partición validada.")
+
     return parser
 
 
 def main() -> int:
     args = build_parser().parse_args()
 
-    products_payload = load_json(
-        Path(
-            args.products_file
+    if args.write_db:
+        if not args.start_date:
+            raise ValueError("--start-date es requerido con --write-db.")
+        start = parse_ymd(args.start_date, "start_date")
+        end = parse_ymd(args.end_date or args.start_date, "end_date")
+        ensure_valid_range(start, end)
+        rows, catalogs = fetch_products_and_catalogs(
+            start_date=start.isoformat(), end_date=end.isoformat(), office_ids=args.office_id
         )
-    )
-
-    catalogs_payload = load_json(
-        Path(
-            args.catalogs_file
-        )
-    )
+        products_payload = {
+            "status": "OK", "start_date": start.isoformat(),
+            "end_date": end.isoformat(), "summary_rows": rows,
+        }
+        catalogs_payload = {"status": "OK", **catalogs}
+    else:
+        if not args.products_file or not args.catalogs_file:
+            raise ValueError("--products-file y --catalogs-file son requeridos sin --write-db.")
+        products_payload = load_json(Path(args.products_file))
+        catalogs_payload = load_json(Path(args.catalogs_file))
 
     payload = build_payload(
         products_payload,
         catalogs_payload,
     )
+
+    database_result = None
+    if args.write_db:
+        if payload["validation"]["status"] != "OK":
+            raise RuntimeError("No se escribió categories_daily: el cuadre no es exacto.")
+        database_result = persist_categories_daily(payload["summary_rows"])
 
     output_path = write_output(
         payload,
@@ -962,6 +1094,7 @@ def main() -> int:
         "output_file": str(
             output_path
         ),
+        "database": database_result,
     }
 
     print(
