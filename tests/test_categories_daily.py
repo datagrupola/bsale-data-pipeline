@@ -357,25 +357,28 @@ class TestCategoriesDaily(unittest.TestCase):
             result["partition_count"],
             1,
         )
+        self.assertEqual(result["mismatch_count"], 0)
+        self.assertEqual(result["unresolved_category_rows"], 0)
+        self.assertEqual(result["partitions"][0]["status"], "OK")
+        self.assertEqual(result["partitions"][0]["differences"]["piezas"], 0)
+        self.assertEqual(result["partitions"][0]["differences"]["venta_total"], 0)
+
+    def test_validation_includes_returns_amount(self):
+        product_rows = [{
+            "fecha": "2026-07-27", "office_id": 2, "piezas": 1,
+            "venta_total": 100, "returns_amount": 20,
+            "net_amount": 86.21, "tax_amount": 13.79,
+        }]
+        category_rows = [{
+            "fecha": "2026-07-27", "office_id": 2, "piezas": 1,
+            "venta_total": 100, "returns_amount": 0,
+            "net_amount": 86.21, "tax_amount": 13.79,
+            "resolution_status": "OK",
+        }]
+        result = validate_categories_daily_summary(product_rows, category_rows)
+        self.assertEqual(result["status"], "ERROR")
         self.assertEqual(
-            result["mismatch_count"],
-            0,
-        )
-        self.assertEqual(
-            result["unresolved_category_rows"],
-            0,
-        )
-        self.assertEqual(
-            result["partitions"][0]["status"],
-            "OK",
-        )
-        self.assertEqual(
-            result["partitions"][0]["differences"]["piezas"],
-            0,
-        )
-        self.assertEqual(
-            result["partitions"][0]["differences"]["venta_total"],
-            0,
+            result["partitions"][0]["differences"]["returns_amount"], -20
         )
 
     def test_validation_detects_mismatch_without_hiding_unresolved(self):
