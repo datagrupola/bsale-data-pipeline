@@ -2,12 +2,16 @@ name: Sync Bsale daily data to Neon
 
 on:
   schedule:
-    # 01:30 America/Mexico_City (UTC-6). Procesa el día fiscal ya cerrado.
+    # 01:30 America/Mexico_City (UTC-6). Procesa únicamente el día fiscal anterior.
     - cron: "30 7 * * *"
   workflow_dispatch:
     inputs:
-      date:
-        description: "Fecha fiscal a procesar (YYYY-MM-DD). Vacío = ayer en Ciudad de México"
+      start_date:
+        description: "Fecha fiscal inicial (YYYY-MM-DD). Vacío = ayer en Ciudad de México"
+        required: false
+        type: string
+      end_date:
+        description: "Fecha fiscal final (YYYY-MM-DD). Vacío = misma fecha inicial"
         required: false
         type: string
 
@@ -27,7 +31,7 @@ jobs:
     # siempre están permitidas para reprocesos o pruebas controladas.
     if: github.event_name == 'workflow_dispatch' || vars.DAILY_SYNC_ENABLED == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 360
 
     env:
       BSALE_ACCESS_TOKEN: ${{ secrets.BSALE_ACCESS_TOKEN }}
@@ -50,59 +54,105 @@ jobs:
       - name: Run unit tests
         run: python -m unittest discover -s tests -v
 
-      - name: Resolve fiscal date
-        id: target_date
+      - name: Resolve fiscal date range
+        id: target_range
         shell: bash
         env:
-          INPUT_DATE: ${{ inputs.date }}
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_START_DATE: ${{ inputs.start_date }}
+          INPUT_END_DATE: ${{ inputs.end_date }}
         run: |
           set -euo pipefail
 
-          if [[ -n "$INPUT_DATE" ]]; then
-            parsed_date="$(date -d "$INPUT_DATE" +%F 2>/dev/null || true)"
-            if [[ ! "$INPUT_DATE" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] \
-              || [[ "$parsed_date" != "$INPUT_DATE" ]]; then
-              echo "Fecha inválida: $INPUT_DATE. Usa YYYY-MM-DD." >&2
+          validate_date() {
+            local value="$1"
+            local parsed_date
+            parsed_date="$(date -d "$value" +%F 2>/dev/null || true)"
+
+            if [[ ! "$value" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] \
+              || [[ "$parsed_date" != "$value" ]]; then
+              echo "Fecha inválida: $value. Usa YYYY-MM-DD." >&2
               exit 1
             fi
-            target_date="$INPUT_DATE"
+          }
+
+          if [[ "$EVENT_NAME" == "schedule" ]]; then
+            start_date="$(TZ=America/Mexico_City date -d 'yesterday' +%F)"
+            end_date="$start_date"
+          elif [[ -z "$INPUT_START_DATE" && -z "$INPUT_END_DATE" ]]; then
+            start_date="$(TZ=America/Mexico_City date -d 'yesterday' +%F)"
+            end_date="$start_date"
+          elif [[ -z "$INPUT_START_DATE" ]]; then
+            echo "Debes indicar start_date cuando uses end_date." >&2
+            exit 1
           else
-            target_date="$(TZ=America/Mexico_City date -d 'yesterday' +%F)"
+            start_date="$INPUT_START_DATE"
+            end_date="${INPUT_END_DATE:-$INPUT_START_DATE}"
           fi
 
-          echo "Procesando fecha fiscal: $target_date"
-          echo "date=$target_date" >> "$GITHUB_OUTPUT"
+          validate_date "$start_date"
+          validate_date "$end_date"
 
-      # El orden es deliberado: products actualiza pieces_sold sobre la partición
-      # que daily_sales crea primero. Cualquier error detiene la cadena.
-      - name: 1. Persist daily sales
-        run: |
-          python -m src.extract_daily_sales \
-            --date "${{ steps.target_date.outputs.date }}" \
-            --write-db \
-            --output-dir output
+          start_epoch="$(date -d "$start_date" +%s)"
+          end_epoch="$(date -d "$end_date" +%s)"
 
-      - name: 2. Persist products and pieces
-        run: |
-          python -m src.extract_products \
-            --start-date "${{ steps.target_date.outputs.date }}" \
-            --end-date "${{ steps.target_date.outputs.date }}" \
-            --write-db \
-            --output-dir output
+          if (( start_epoch > end_epoch )); then
+            echo "Rango inválido: start_date no puede ser posterior a end_date." >&2
+            exit 1
+          fi
 
-      - name: 3. Materialize daily categories
+          days=$(( (end_epoch - start_epoch) / 86400 + 1 ))
+
+          echo "Procesando rango fiscal: $start_date a $end_date ($days día(s))"
+          echo "start_date=$start_date" >> "$GITHUB_OUTPUT"
+          echo "end_date=$end_date" >> "$GITHUB_OUTPUT"
+          echo "days=$days" >> "$GITHUB_OUTPUT"
+          echo "label=$start_date-to-$end_date" >> "$GITHUB_OUTPUT"
+
+      # Cada fecha se completa en orden antes de avanzar a la siguiente.
+      # Cualquier error detiene inmediatamente toda la ejecución.
+      - name: Sync fiscal date range
+        shell: bash
+        env:
+          START_DATE: ${{ steps.target_range.outputs.start_date }}
+          END_DATE: ${{ steps.target_range.outputs.end_date }}
         run: |
-          python -m src.build_categories_daily \
-            --start-date "${{ steps.target_date.outputs.date }}" \
-            --end-date "${{ steps.target_date.outputs.date }}" \
-            --write-db \
-            --output-dir output
+          set -euo pipefail
+
+          current_date="$START_DATE"
+
+          while [[ "$current_date" < "$END_DATE" || "$current_date" == "$END_DATE" ]]; do
+            echo "::group::Fecha fiscal $current_date"
+
+            echo "1/3 Persistiendo ventas diarias"
+            python -m src.extract_daily_sales \
+              --date "$current_date" \
+              --write-db \
+              --output-dir output
+
+            echo "2/3 Persistiendo productos y piezas"
+            python -m src.extract_products \
+              --start-date "$current_date" \
+              --end-date "$current_date" \
+              --write-db \
+              --output-dir output
+
+            echo "3/3 Materializando categorías diarias"
+            python -m src.build_categories_daily \
+              --start-date "$current_date" \
+              --end-date "$current_date" \
+              --write-db \
+              --output-dir output
+
+            echo "::endgroup::"
+            current_date="$(date -d "$current_date + 1 day" +%F)"
+          done
 
       - name: Upload run artifacts
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: bsale-neon-sync-${{ steps.target_date.outputs.date || github.run_id }}
+          name: bsale-neon-sync-${{ steps.target_range.outputs.label || github.run_id }}
           path: output/*.json
           if-no-files-found: warn
           retention-days: 14
