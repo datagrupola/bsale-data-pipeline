@@ -1,6 +1,7 @@
 # Bsale data pipeline
 
-Primera etapa de migración del módulo `syncDailySalesChino.gs`.
+Migración completa del pipeline de extracción de Bsale desde Google Apps Script
+hacia Python, GitHub Actions y Neon/PostgreSQL.
 
 ## Alcance actual
 
