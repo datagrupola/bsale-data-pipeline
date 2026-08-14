@@ -26,7 +26,7 @@ concurrency:
 
 jobs:
   sync:
-    name: Sales, products and categories
+    name: Sales, products, category catalogs and categories
     # El valor ausente se interpreta como apagado. Las ejecuciones manuales
     # siempre están permitidas para reprocesos o pruebas controladas.
     if: github.event_name == 'workflow_dispatch' || vars.DAILY_SYNC_ENABLED == 'true'
@@ -53,6 +53,11 @@ jobs:
 
       - name: Run unit tests
         run: python -m unittest discover -s tests -v
+
+      # Se refrescan una sola vez por ejecución antes de materializar categorías.
+      # El módulo hace upsert seguro y no elimina entradas históricas.
+      - name: Refresh category catalogs
+        run: python -m src.extract_category_catalogs --write-db --output-dir output
 
       - name: Resolve fiscal date range
         id: target_range
